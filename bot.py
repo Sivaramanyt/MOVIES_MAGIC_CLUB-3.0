@@ -23,14 +23,18 @@ def page_count(total: int) -> int:
     return max(1, math.ceil(total / RESULTS_PER_PAGE))
 
 
-def result_keyboard(query: str, page: int, total: int):
+def poster_keyboard(query: str, page: int, total: int, file_id: str):
+    """One movie card: select the movie first, then browse its files."""
     pages = page_count(total)
-    row = []
+    rows = [[InlineKeyboardButton("🎬 Select Movie", callback_data=f"movie|{file_id}")]]
+    nav = []
     if page > 0:
-        row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"search|{page-1}|{query[:40]}"))
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"search|{page-1}|{query[:40]}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
     if page + 1 < pages:
-        row.append(InlineKeyboardButton("Next ➡️", callback_data=f"search|{page+1}|{query[:40]}"))
-    return InlineKeyboardMarkup([row]) if row else None
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"search|{page+1}|{query[:40]}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(rows)
 
 
 def language_text(item: dict) -> str:
@@ -38,12 +42,11 @@ def language_text(item: dict) -> str:
     return ", ".join(x.title() for x in languages) if languages else "Not specified"
 
 
-def format_card(item: dict) -> str:
+def movie_card(item: dict) -> str:
     title = item.get("tmdb_title") or item.get("title") or "Unknown"
     year = item.get("tmdb_year") or item.get("year")
     rating = item.get("rating")
     genres = item.get("genres") or []
-    quality = item.get("quality")
     lines = [f"🎬 **{title}**"]
     details = []
     if year:
@@ -55,9 +58,15 @@ def format_card(item: dict) -> str:
     if genres:
         lines.append("🎭 " + ", ".join(genres))
     lines.append("🌐 " + language_text(item))
-    if quality:
-        lines.append(f"🎞 {quality}")
     return "\n".join(lines)
+
+
+def file_card(item: dict) -> str:
+    text = movie_card(item)
+    quality = item.get("quality")
+    if quality:
+        text += f"\n🎞 {quality}"
+    return text
 
 
 async def enrich_item(item: dict) -> dict:
@@ -98,7 +107,24 @@ async def build_results(query: str, page: int):
     return total, enriched
 
 
-async def send_result_cards(message, query: str, page: int = 0):
+async def send_movie_card(message, item: dict, query: str, page: int, total: int):
+    caption = movie_card(item)
+    markup = poster_keyboard(query, page, total, item["file_id"])
+    poster = item.get("poster_url")
+    if poster:
+        try:
+            return await message.reply_photo(
+                photo=poster,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+    return await message.reply_text(caption, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+
+async def render_search(message, query: str, page: int = 0):
     query = query.strip()
     if not query:
         return await message.reply_text("🔎 Send a movie or series name.")
@@ -106,29 +132,48 @@ async def send_result_cards(message, query: str, page: int = 0):
     if not total:
         return await message.reply_text(f"❌ No results found for **{query}**.", parse_mode=ParseMode.MARKDOWN)
 
-    pages = page_count(total)
+    # Exactly one poster card per result. File/language/quality choices are
+    # intentionally deferred until the user selects the movie.
     for item in items:
-        caption = format_card(item)
-        button = InlineKeyboardMarkup([[InlineKeyboardButton(
-            f"📥 Get {item.get('tmdb_title') or item.get('title', 'File')[:35]}",
-            callback_data=f"file|{item['file_id']}"
-        )]])
-        poster = item.get("poster_url")
-        if poster:
-            try:
-                await message.reply_photo(photo=poster, caption=caption, reply_markup=button, parse_mode=ParseMode.MARKDOWN)
-                continue
-            except Exception:
-                pass
-        await message.reply_text(caption, reply_markup=button, parse_mode=ParseMode.MARKDOWN)
+        await send_movie_card(message, item, query, page, total)
 
-    nav = result_keyboard(query, page, total)
-    if nav:
-        await message.reply_text(
-            f"📄 **Page {page + 1}/{pages}** • `{total}` results",
-            reply_markup=nav,
-            parse_mode=ParseMode.MARKDOWN,
-        )
+
+async def show_movie_options(message, selected: dict):
+    """Step 2: group all indexed files belonging to the selected movie."""
+    title = selected.get("tmdb_title") or selected.get("title") or "Movie"
+    year = selected.get("tmdb_year") or selected.get("year")
+    match = {"title": selected.get("title")}
+    if selected.get("tmdb_id"):
+        match = {"tmdb_id": selected["tmdb_id"]}
+    files = await db.files.find(match).sort("quality", 1).to_list(length=100)
+    if not files:
+        files = [selected]
+    for item in files:
+        try:
+            await enrich_item(item)
+        except Exception:
+            pass
+
+    languages = sorted({x for f in files for x in (f.get("languages") or [])})
+    qualities = sorted({f.get("quality") for f in files if f.get("quality")})
+    lines = [f"🎬 **{title}**"]
+    if year:
+        lines.append(f"📅 {year}")
+    lines.append("\n🌐 **Select Language**")
+    rows = [[InlineKeyboardButton(lang.title(), callback_data=f"lang|{selected.get('tmdb_id', '')}|{lang}") for lang in languages[i:i+2]] for i in range(0, len(languages), 2)]
+    if not rows:
+        rows = [[InlineKeyboardButton("🌐 All Languages", callback_data=f"lang|{selected.get('tmdb_id', '')}|all")]]
+    return await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
+
+
+async def find_movie_files(tmdb_id, language=None):
+    if tmdb_id:
+        files = await db.files.find({"tmdb_id": int(tmdb_id)}).to_list(length=100)
+    else:
+        files = []
+    if language and language != "all":
+        files = [f for f in files if language.lower() in [x.lower() for x in (f.get("languages") or [])]]
+    return files
 
 
 @app.on_message(filters.command("start") & filters.private)
@@ -136,13 +181,7 @@ async def start(_, message):
     await db.add_user(message.from_user.id)
     if not await subscribed(app, message.from_user.id):
         return await message.reply_text("🔒 Please join the required channel first, then try again.")
-    await message.reply_text(
-        "🎬 **Movies Magic Club 3.0**\n\n"
-        "Send me a movie or series name and I will search the indexed Telegram files.\n\n"
-        "Example: `Leo 2023`\n\n"
-        "⚡ Fast • Simple • TMDB-powered",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await message.reply_text("🎬 **Movies Magic Club 3.0**\n\nSend a movie or series name to search.", parse_mode=ParseMode.MARKDOWN)
 
 
 @app.on_message(filters.command("help") & filters.private)
@@ -155,10 +194,7 @@ async def stats(_, message):
     if message.from_user.id not in ADMINS:
         return
     files, users, movies = await db.stats()
-    await message.reply_text(
-        f"📊 **Stats**\n\n📁 Indexed files: `{files}`\n👤 Users: `{users}`\n🎬 TMDB movies: `{movies}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await message.reply_text(f"📊 **Stats**\n\n📁 Files: `{files}`\n👤 Users: `{users}`\n🎬 TMDB movies: `{movies}`", parse_mode=ParseMode.MARKDOWN)
 
 
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "help", "stats", "cancel"]))
@@ -166,7 +202,7 @@ async def search_handler(_, message):
     if not await subscribed(app, message.from_user.id):
         return await message.reply_text("🔒 Please join the required channel first.")
     await db.add_user(message.from_user.id)
-    await send_result_cards(message, message.text)
+    await render_search(message, message.text)
 
 
 @app.on_callback_query(filters.regex(r"^search\|"))
@@ -174,14 +210,44 @@ async def page_callback(_, query: CallbackQuery):
     _, page, search = query.data.split("|", 2)
     page = max(0, int(page))
     total = await db.count_files(search)
-    pages = page_count(total)
-    page = min(page, pages - 1)
-    await query.answer(f"Loading page {page + 1}/{pages}…")
-    await send_result_cards(query.message, search, page)
+    page = min(page, page_count(total) - 1)
+    await query.answer()
+    # Keep the selected search and replace the navigation message with the
+    # next page's one-card-per-movie results.
+    await render_search(query.message, search, page)
     try:
         await query.message.delete()
     except Exception:
         pass
+
+
+@app.on_callback_query(filters.regex(r"^movie\|"))
+async def movie_callback(_, query: CallbackQuery):
+    file_id = query.data.split("|", 1)[1]
+    selected = await db.files.find_one({"file_id": file_id})
+    if not selected:
+        return await query.answer("Movie is no longer indexed.", show_alert=True)
+    try:
+        selected = await enrich_item(selected)
+    except Exception:
+        pass
+    await query.answer()
+    await show_movie_options(query.message, selected)
+
+
+@app.on_callback_query(filters.regex(r"^lang\|"))
+async def language_callback(_, query: CallbackQuery):
+    _, tmdb_id, language = query.data.split("|", 2)
+    files = await find_movie_files(tmdb_id, language)
+    if not files:
+        return await query.answer("No files found for this language.", show_alert=True)
+    rows = []
+    for index, item in enumerate(files):
+        quality = item.get("quality") or "Quality unknown"
+        label = f"🎞 {language.title()} • {quality}"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"file|{item['file_id']}")])
+    await query.answer()
+    await query.message.edit_text("🎞 **Select Quality / File**", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
 
 
 @app.on_callback_query(filters.regex(r"^file\|"))
@@ -195,7 +261,12 @@ async def file_callback(_, query: CallbackQuery):
     except Exception:
         pass
     await query.answer("Sending file…")
-    await app.send_cached_media(query.from_user.id, file_id, caption=format_card(item))
+    await app.send_cached_media(query.from_user.id, file_id, caption=file_card(item))
+
+
+@app.on_callback_query(filters.regex(r"^noop$"))
+async def noop(_, query: CallbackQuery):
+    await query.answer()
 
 
 @app.on_message(filters.channel & (filters.document | filters.video | filters.audio), group=10)
