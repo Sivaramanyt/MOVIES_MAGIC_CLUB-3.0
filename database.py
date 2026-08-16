@@ -16,12 +16,26 @@ class Database:
         await self.files.create_index("title")
         await self.files.create_index("tmdb_id")
         await self.files.create_index([("normalized_title", 1), ("year", 1)])
+        await self.files.create_index([("duplicate_name", 1), ("size", 1), ("quality", 1)])
         await self.movies.create_index("tmdb_id", unique=True, sparse=True)
         await self.movies.create_index([("normalized_title", 1), ("year", 1)])
         await self.users.create_index("user_id", unique=True)
 
     async def add_user(self, user_id: int):
         await self.users.update_one({"user_id": user_id}, {"$set": {"user_id": user_id}}, upsert=True)
+
+    async def find_duplicate_file(self, name: str, size: int, quality: str | None, exclude_unique_id: str | None = None):
+        """Find an existing file with the same name, size and quality.
+
+        file_unique_id is excluded so a file can never match itself during
+        reindexing. Name comparison is case-insensitive and whitespace-normalized.
+        """
+        import re
+        duplicate_name = re.sub(r"\s+", " ", (name or "").strip()).casefold()
+        query = {"duplicate_name": duplicate_name, "size": int(size or 0), "quality": quality or ""}
+        if exclude_unique_id:
+            query["file_unique_id"] = {"$ne": exclude_unique_id}
+        return await self.files.find_one(query, sort=[("_id", 1)])
 
     async def add_file(self, data: dict) -> bool:
         try:
@@ -31,6 +45,9 @@ class Database:
             if "duplicate key" in str(exc).lower():
                 return False
             raise
+
+    async def update_file(self, file_id: str, data: dict):
+        await self.files.update_one({"file_id": file_id}, {"$set": data})
 
     async def update_file_tmdb(self, file_id: str, metadata: dict):
         await self.files.update_one({"file_id": file_id}, {"$set": metadata})
@@ -47,13 +64,8 @@ class Database:
         return await self.files.count_documents({"search_text": regex})
 
     async def find_grouped_movies(self, query: str, skip: int, limit: int):
-        """Return one representative movie document per logical movie.
-
-        TMDB ID is the strongest key. For files without a TMDB match, title+year
-        is used. The first representative is sorted newest-first so its poster
-        and metadata can be used for the movie card.
-        """
-        safe = query.replace(".", r"\.").replace("*", "").strip()
+        safe = query.replace(".", r"\. ").replace("*", "").strip()
+        safe = safe.replace(r"\. ", r"\.")
         regex = {"$regex": safe, "$options": "i"}
         pipeline = [
             {"$match": {"search_text": regex}},
@@ -98,7 +110,8 @@ class Database:
         return rows
 
     async def count_grouped_movies(self, query: str) -> int:
-        safe = query.replace(".", r"\.").replace("*", "").strip()
+        safe = query.replace(".", r"\. ").replace("*", "").strip()
+        safe = safe.replace(r"\. ", r"\.")
         regex = {"$regex": safe, "$options": "i"}
         pipeline = [
             {"$match": {"search_text": regex}},
