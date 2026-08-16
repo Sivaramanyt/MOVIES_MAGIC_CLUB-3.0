@@ -1,12 +1,11 @@
 import asyncio
+import logging
 import math
 import re
 import time
 
-from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from pyrogram.errors import UserNotParticipant
+from telethon import TelegramClient, events, Button
+from telethon.errors import UserNotParticipantError
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, MONGO_URI, DATABASE_NAME, CHANNEL_ID,
@@ -16,10 +15,21 @@ from config import (
 from database import Database
 from parser import parse_media
 from tmdb import TMDBClient
-from shortlink_verification import VerificationStore, maybe_create_verification, CONFIG as VERIFICATION_CONFIG
+from shortlink_verification import VerificationStore, maybe_create_verification
 from health_server import start_health_server, stop_health_server
 
-app = Client("movies_magic_club", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+logging.basicConfig(
+    format="[%(levelname)s %(asctime)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+
+app = TelegramClient(
+    "movies_magic_club_telethon",
+    API_ID,
+    API_HASH,
+    auto_reconnect=True,
+    receive_updates=True,
+)
 db = Database(MONGO_URI, DATABASE_NAME)
 tmdb = TMDBClient(TMDB_API_KEY)
 verification = VerificationStore(db)
@@ -41,15 +51,15 @@ def safe_duplicate_policy(data: dict) -> bool:
 
 def poster_keyboard(query: str, page: int, total: int, group_key: str):
     pages = page_count(total)
-    rows = [[InlineKeyboardButton("🎬 Select Movie", callback_data=f"movie|{group_key}")]]
+    rows = [[Button.inline("🎬 Select Movie", data=f"movie|{group_key}")]]
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"search|{page-1}|{query[:40]}"))
-    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+        nav.append(Button.inline("⬅️ Previous", data=f"search|{page-1}|{query[:40]}"))
+    nav.append(Button.inline(f"{page + 1}/{pages}", data="noop"))
     if page + 1 < pages:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"search|{page+1}|{query[:40]}"))
+        nav.append(Button.inline("Next ➡️", data=f"search|{page+1}|{query[:40]}"))
     rows.append(nav)
-    return InlineKeyboardMarkup(rows)
+    return rows
 
 
 def movie_card(item: dict) -> str:
@@ -61,12 +71,18 @@ def movie_card(item: dict) -> str:
     qualities = item.get("group_qualities") or []
     lines = [f"🎬 **{title}**"]
     details = []
-    if year: details.append(f"📅 {year}")
-    if rating is not None: details.append(f"⭐ {rating}/10")
-    if details: lines.append(" • ".join(details))
-    if genres: lines.append("🎭 " + ", ".join(genres))
-    if languages: lines.append("🌐 " + ", ".join(x.title() for x in languages))
-    if qualities: lines.append("🎞 " + ", ".join(qualities))
+    if year:
+        details.append(f"📅 {year}")
+    if rating is not None:
+        details.append(f"⭐ {rating}/10")
+    if details:
+        lines.append(" • ".join(details))
+    if genres:
+        lines.append("🎭 " + ", ".join(genres))
+    if languages:
+        lines.append("🌐 " + ", ".join(x.title() for x in languages))
+    if qualities:
+        lines.append("🎞 " + ", ".join(qualities))
     return "\n".join(lines)
 
 
@@ -76,7 +92,8 @@ def file_card(item: dict) -> str:
     quality = item.get("quality") or "Quality unknown"
     languages = ", ".join(x.title() for x in (item.get("languages") or [])) or "Not specified"
     lines = [f"🎬 **{title}**"]
-    if year: lines.append(f"📅 {year}")
+    if year:
+        lines.append(f"📅 {year}")
     lines.append(f"🌐 {languages}")
     lines.append(f"🎞 {quality}")
     return "\n".join(lines)
@@ -94,14 +111,23 @@ async def enrich_item(item: dict) -> dict:
     return item
 
 
-async def build_file_data(message, media):
-    name = getattr(media, "file_name", None) or message.caption or "Unknown"
-    meta = parse_media(name, message.caption or "")
+async def build_file_data(message):
+    media = message.document or message.video or message.audio
+    file = message.file
+    name = (file.name if file else None) or message.raw_text or "Unknown"
+    meta = parse_media(name, message.raw_text or "")
+    file_id = file.id if file else None
+    unique_id = str(file_id) if file_id is not None else str(message.id)
     return {
-        **meta, "file_id": media.file_id, "file_unique_id": media.file_unique_id,
-        "file_name": name, "duplicate_name": normalize_filename(name),
-        "size": getattr(media, "file_size", 0), "mime_type": getattr(media, "mime_type", ""),
-        "message_id": message.id, "channel_id": message.chat.id,
+        **meta,
+        "file_id": file_id,
+        "file_unique_id": unique_id,
+        "file_name": name,
+        "duplicate_name": normalize_filename(name),
+        "size": getattr(file, "size", 0) or 0,
+        "mime_type": getattr(file, "mime_type", "") or "",
+        "message_id": message.id,
+        "channel_id": message.chat_id,
     }
 
 
@@ -122,10 +148,11 @@ async def find_safe_duplicate(data: dict):
 
 
 async def index_media_message(message) -> bool:
-    media = message.document or message.video or message.audio
-    if not media:
+    if not (message.document or message.video or message.audio):
         return False
-    data = await build_file_data(message, media)
+    data = await build_file_data(message)
+    if not data.get("file_id"):
+        return False
     duplicate = await find_safe_duplicate(data)
     if duplicate and AUTO_DELETE_DUPLICATES:
         await delete_duplicate_channel_message(message, duplicate)
@@ -148,15 +175,14 @@ async def index_media_message(message) -> bool:
 
 async def reindex_channel(progress_callback=None, delete_duplicates=False) -> dict:
     stats = {"scanned": 0, "indexed": 0, "enriched": 0, "failed": 0, "duplicates": 0, "last_message_id": 0}
-    async for history_message in app.get_chat_history(CHANNEL_ID):
-        media = history_message.document or history_message.video or history_message.audio
-        if not media:
+    async for history_message in app.iter_messages(CHANNEL_ID):
+        if not (history_message.document or history_message.video or history_message.audio):
             continue
         stats["scanned"] += 1
         stats["last_message_id"] = history_message.id
         try:
-            data = await build_file_data(history_message, media)
-            existing = await db.files.find_one({"file_unique_id": media.file_unique_id})
+            data = await build_file_data(history_message)
+            existing = await db.files.find_one({"file_unique_id": data.get("file_unique_id")})
             duplicate = await find_safe_duplicate(data)
             is_other_record = duplicate and (not existing or duplicate.get("file_id") != existing.get("file_id"))
             if is_other_record:
@@ -199,15 +225,16 @@ def format_reindex_progress(stats: dict, started_at: float, running: bool = True
             f"♻️ Duplicate candidates: `{stats.get('duplicates', 0)}`\n⚠️ Failed: `{stats['failed']}`\n⚡ Speed: `{stats['scanned']/elapsed:.1f} files/s`\n🆔 Last message: `{stats.get('last_message_id', 0)}`")
 
 
-async def subscribed(client, user_id: int) -> bool:
+async def subscribed(user_id: int) -> bool:
     if not FORCE_SUB_CHANNEL:
         return True
     try:
-        await client.get_chat_member(FORCE_SUB_CHANNEL, user_id)
+        await app.get_permissions(FORCE_SUB_CHANNEL, user_id)
         return True
-    except UserNotParticipant:
+    except UserNotParticipantError:
         return False
-    except Exception:
+    except Exception as exc:
+        print(f"Force-sub check failed: {exc}")
         return True
 
 
@@ -231,19 +258,19 @@ async def send_movie_card(message, item: dict, query: str, page: int, total: int
     poster = item.get("poster_url")
     if poster:
         try:
-            return await message.reply_photo(photo=poster, caption=movie_card(item), reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+            return await message.reply(file=poster, message=movie_card(item), buttons=markup, parse_mode="md")
         except Exception as exc:
             print(f"Poster send failed, falling back to text: {exc}")
-    return await message.reply_text(movie_card(item), reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    return await message.reply(movie_card(item), buttons=markup, parse_mode="md")
 
 
 async def render_search(message, query: str, page: int = 0):
     query = query.strip()
     if not query:
-        return await message.reply_text("🔎 Send a movie or series name.")
+        return await message.reply("🔎 Send a movie or series name.")
     total, items = await build_results(query, page)
     if not total:
-        return await message.reply_text(f"❌ No results found for **{query}**.", parse_mode=ParseMode.MARKDOWN)
+        return await message.reply(f"❌ No results found for **{query}**.", parse_mode="md")
     for item in items:
         await send_movie_card(message, item, query, page, total)
 
@@ -259,10 +286,10 @@ async def show_movie_options(message, selected: dict):
     lines.append("\n🌐 **Select Language**")
     rows = []
     for i in range(0, len(languages), 2):
-        rows.append([InlineKeyboardButton(lang.title(), callback_data=f"lang|{selected.get('tmdb_id', '')}|{lang}") for lang in languages[i:i+2]])
+        rows.append([Button.inline(lang.title(), data=f"lang|{selected.get('tmdb_id', '')}|{lang}") for lang in languages[i:i+2]])
     if not rows:
-        rows = [[InlineKeyboardButton("🌐 All Languages", callback_data=f"lang|{selected.get('tmdb_id', '')}|all")]]
-    return await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
+        rows = [[Button.inline("🌐 All Languages", data=f"lang|{selected.get('tmdb_id', '')}|all")]]
+    return await message.reply("\n".join(lines), buttons=rows, parse_mode="md")
 
 
 async def find_movie_files(tmdb_id, language=None, fallback_key=None):
@@ -279,59 +306,61 @@ async def find_movie_files(tmdb_id, language=None, fallback_key=None):
 
 
 async def send_file_after_verification(user_id: int, file_id: str, caption_item: dict):
-    await app.send_cached_media(user_id, file_id, caption=file_card(caption_item))
+    await app.send_file(user_id, file_id, caption=file_card(caption_item), parse_mode="md")
 
 
-@app.on_message(filters.command("start") & filters.private)
-async def start(_, message):
-    await db.add_user(message.from_user.id)
-    args = message.text.split(maxsplit=1)
+@app.on(events.NewMessage(pattern=r"^/start(?:\s+.*)?$", incoming=True, func=lambda e: e.is_private))
+async def start(event):
+    user_id = event.sender_id
+    print(f"📥 /start received from user_id={user_id}")
+    await db.add_user(user_id)
+    args = event.raw_text.split(maxsplit=1)
     if len(args) == 2 and args[1].startswith("verify_"):
         token = args[1][7:]
-        doc = await verification.consume(token, message.from_user.id)
+        doc = await verification.consume(token, user_id)
         if not doc:
-            return await message.reply_text("❌ Verification link is invalid or expired. Please request a new verification link.")
+            return await event.reply("❌ Verification link is invalid or expired. Please request a new verification link.")
         file_id = doc.get("file_id")
         item = await db.files.find_one({"file_id": file_id}) if file_id else None
         if not item:
-            return await message.reply_text("⚠️ Verification succeeded, but the requested file is no longer available.")
-        await message.reply_text("✅ **Verification successful!**\nSending your file…", parse_mode=ParseMode.MARKDOWN)
-        return await send_file_after_verification(message.from_user.id, file_id, item)
-    if not await subscribed(app, message.from_user.id):
-        return await message.reply_text("🔒 Please join the required channel first, then try again.")
-    await message.reply_text("🎬 **Movies Magic Club 3.0**\n\nSend a movie or series name to search.", parse_mode=ParseMode.MARKDOWN)
+            return await event.reply("⚠️ Verification succeeded, but the requested file is no longer available.")
+        await event.reply("✅ **Verification successful!**\nSending your file…", parse_mode="md")
+        return await send_file_after_verification(user_id, file_id, item)
+    if not await subscribed(user_id):
+        return await event.reply("🔒 Please join the required channel first, then try again.")
+    await event.reply("🎬 **Movies Magic Club 3.0**\n\nSend a movie or series name to search.", parse_mode="md")
 
 
-@app.on_message(filters.command("ping") & filters.private)
-async def ping_cmd(_, message):
-    print(f"📥 /ping received from user_id={message.from_user.id}")
-    await message.reply_text("🏓 Pong! Bot update handling is working.")
+@app.on(events.NewMessage(pattern=r"^/ping(?:@\w+)?$", incoming=True, func=lambda e: e.is_private))
+async def ping_cmd(event):
+    print(f"📥 /ping received from user_id={event.sender_id}")
+    await event.reply("🏓 Pong! Bot update handling is working.")
 
 
-@app.on_message(filters.command("help") & filters.private)
-async def help_cmd(_, message):
-    await message.reply_text("🔎 Send a movie/series name to search.\n\nAdmins: `/stats`\n🔄 Admin: `/reindex`", parse_mode=ParseMode.MARKDOWN)
+@app.on(events.NewMessage(pattern=r"^/help(?:@\w+)?$", incoming=True, func=lambda e: e.is_private))
+async def help_cmd(event):
+    await event.reply("🔎 Send a movie/series name to search.\n\nAdmins: `/stats`\n🔄 Admin: `/reindex`", parse_mode="md")
 
 
-@app.on_message(filters.command("stats") & filters.private)
-async def stats(_, message):
-    if message.from_user.id not in ADMINS:
+@app.on(events.NewMessage(pattern=r"^/stats(?:@\w+)?$", incoming=True, func=lambda e: e.is_private))
+async def stats(event):
+    if event.sender_id not in ADMINS:
         return
     files, users, movies = await db.stats()
-    await message.reply_text(f"📊 **Stats**\n\n📁 Files: `{files}`\n👤 Users: `{users}`\n🎬 TMDB movies: `{movies}`", parse_mode=ParseMode.MARKDOWN)
+    await event.reply(f"📊 **Stats**\n\n📁 Files: `{files}`\n👤 Users: `{users}`\n🎬 TMDB movies: `{movies}`", parse_mode="md")
 
 
-@app.on_message(filters.command("reindex") & filters.private)
-async def reindex_cmd(_, message):
-    if message.from_user.id not in ADMINS:
-        return await message.reply_text("⛔ You are not authorized to use this command.")
-    args = message.text.split()[1:]
+@app.on(events.NewMessage(pattern=r"^/reindex(?:\s+.*)?$", incoming=True, func=lambda e: e.is_private))
+async def reindex_cmd(event):
+    if event.sender_id not in ADMINS:
+        return await event.reply("⛔ You are not authorized to use this command.")
+    args = event.raw_text.split()[1:]
     delete_requested = "--delete" in args
     delete_mode = delete_requested and not REINDEX_DRY_RUN
     if delete_requested and REINDEX_DRY_RUN:
-        return await message.reply_text("🛡️ REINDEX_DRY_RUN is enabled, so deletion is blocked. Set `REINDEX_DRY_RUN=false` before using `/reindex --delete`.", parse_mode=ParseMode.MARKDOWN)
+        return await event.reply("🛡️ REINDEX_DRY_RUN is enabled, so deletion is blocked. Set `REINDEX_DRY_RUN=false` before using `/reindex --delete`.", parse_mode="md")
     started_at = time.monotonic()
-    status = await message.reply_text("🔄 **Reindexing…**\n🛡️ DRY RUN — no messages will be deleted\n\n📦 Scanned: `0`\n🗂 Indexed: `0`\n🧩 Enriched: `0`\n♻️ Duplicate candidates: `0`\n⚠️ Failed: `0`", parse_mode=ParseMode.MARKDOWN)
+    status = await event.reply("🔄 **Reindexing…**\n🛡️ DRY RUN — no messages will be deleted\n\n📦 Scanned: `0`\n🗂 Indexed: `0`\n🧩 Enriched: `0`\n♻️ Duplicate candidates: `0`\n⚠️ Failed: `0`", parse_mode="md")
     last_update = 0.0
 
     async def progress(stats):
@@ -341,43 +370,46 @@ async def reindex_cmd(_, message):
             return
         last_update = now
         try:
-            await status.edit_text(format_reindex_progress(stats, started_at, True, not delete_mode), parse_mode=ParseMode.MARKDOWN)
+            await status.edit(format_reindex_progress(stats, started_at, True, not delete_mode), parse_mode="md")
         except Exception as exc:
             print(f"Reindex progress update failed: {exc}")
 
     try:
         final = await reindex_channel(progress, delete_duplicates=delete_mode)
-        await status.edit_text(format_reindex_progress(final, started_at, False, not delete_mode), parse_mode=ParseMode.MARKDOWN)
+        await status.edit(format_reindex_progress(final, started_at, False, not delete_mode), parse_mode="md")
     except Exception as exc:
-        await status.edit_text(f"❌ **Reindex failed**\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
+        await status.edit(f"❌ **Reindex failed**\n`{exc}`", parse_mode="md")
 
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "ping", "help", "stats", "reindex", "cancel"]))
-async def search_handler(_, message):
-    if not await subscribed(app, message.from_user.id):
-        return await message.reply_text("🔒 Please join the required channel first.")
-    await db.add_user(message.from_user.id)
-    print(f"📥 Search received from user_id={message.from_user.id}: {message.text[:80]!r}")
-    await render_search(message, message.text)
+@app.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and bool(e.raw_text) and not e.raw_text.startswith("/")))
+async def search_handler(event):
+    if not await subscribed(event.sender_id):
+        return await event.reply("🔒 Please join the required channel first.")
+    await db.add_user(event.sender_id)
+    print(f"📥 Search received from user_id={event.sender_id}: {event.raw_text[:80]!r}")
+    await render_search(event.message, event.raw_text)
 
 
-@app.on_callback_query(filters.regex(r"^search\|"))
-async def page_callback(_, query: CallbackQuery):
-    _, page, search = query.data.split("|", 2)
+@app.on(events.CallbackQuery(pattern=re.compile(rb"^search\|")))
+async def page_callback(event):
+    data = event.data.decode("utf-8", errors="replace")
+    _, page, search = data.split("|", 2)
     page = max(0, int(page))
     total = await db.count_grouped_movies(search)
-    page = min(page, page_count(total)-1)
-    await query.answer()
-    await render_search(query.message, search, page)
+    page = min(page, page_count(total) - 1)
+    await event.answer()
+    message = await event.get_message()
+    await render_search(message, search, page)
     try:
-        await query.message.delete()
+        await message.delete()
     except Exception:
         pass
 
 
-@app.on_callback_query(filters.regex(r"^movie\|"))
-async def movie_callback(_, query: CallbackQuery):
-    group_key = query.data.split("|", 1)[1]
+@app.on(events.CallbackQuery(pattern=re.compile(rb"^movie\|")))
+async def movie_callback(event):
+    data = event.data.decode("utf-8", errors="replace")
+    group_key = data.split("|", 1)[1]
     selected = None
     if group_key.startswith("tmdb:"):
         try:
@@ -389,74 +421,75 @@ async def movie_callback(_, query: CallbackQuery):
         title, year = value.rsplit(":", 1)
         selected = await db.files.find_one({"normalized_title": title, "year": int(year)})
     if not selected:
-        return await query.answer("Movie is no longer indexed.", show_alert=True)
-    await query.answer()
-    await show_movie_options(query.message, selected)
+        return await event.answer("Movie is no longer indexed.", alert=True)
+    await event.answer()
+    message = await event.get_message()
+    await show_movie_options(message, selected)
 
 
-@app.on_callback_query(filters.regex(r"^lang\|"))
-async def language_callback(_, query: CallbackQuery):
-    _, tmdb_id, language = query.data.split("|", 2)
+@app.on(events.CallbackQuery(pattern=re.compile(rb"^lang\|")))
+async def language_callback(event):
+    data = event.data.decode("utf-8", errors="replace")
+    _, tmdb_id, language = data.split("|", 2)
     files = await find_movie_files(tmdb_id, language)
     if not files:
-        return await query.answer("No files found for this language.", show_alert=True)
-    rows = [[InlineKeyboardButton(f"🎞 {(language.title())} • {(item.get('quality') or 'Quality unknown')}"[:60], callback_data=f"file|{item['file_id']}")] for item in files]
-    await query.answer()
-    await query.message.edit_text("🎞 **Select Quality / File**", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
+        return await event.answer("No files found for this language.", alert=True)
+    rows = [[Button.inline(f"🎞 {language.title()} • {(item.get('quality') or 'Quality unknown')}"[:60], data=f"file|{item['file_id']}")] for item in files]
+    await event.answer()
+    await event.edit("🎞 **Select Quality / File**", buttons=rows, parse_mode="md")
 
 
-@app.on_callback_query(filters.regex(r"^file\|"))
-async def file_callback(_, query: CallbackQuery):
-    file_id = query.data.split("|", 1)[1]
+@app.on(events.CallbackQuery(pattern=re.compile(rb"^file\|")))
+async def file_callback(event):
+    data = event.data.decode("utf-8", errors="replace")
+    file_id = data.split("|", 1)[1]
     item = await db.files.find_one({"file_id": file_id})
     if not item:
-        return await query.answer("File no longer exists in the index.", show_alert=True)
-    await query.answer()
+        return await event.answer("File no longer exists in the index.", alert=True)
+    await event.answer()
     try:
-        shortlink = await maybe_create_verification(verification, query.from_user.id, file_id)
+        shortlink = await maybe_create_verification(verification, event.sender_id, file_id)
     except Exception as exc:
         print(f"Verification creation failed: {exc}")
-        return await query.message.reply_text("⚠️ Verification service is temporarily unavailable. Please try again later.")
+        return await event.reply("⚠️ Verification service is temporarily unavailable. Please try again later.")
     if shortlink:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Verify & Get File", url=shortlink)]])
-        return await query.message.reply_text("🔒 **Verification required**\n\nComplete the shortlink verification, then Telegram will automatically send your requested file.", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-    await send_file_after_verification(query.from_user.id, file_id, item)
+        keyboard = [[Button.url("🔐 Verify & Get File", shortlink)]]
+        return await event.reply("🔒 **Verification required**\n\nComplete the shortlink verification, then Telegram will automatically send your requested file.", buttons=keyboard, parse_mode="md")
+    await send_file_after_verification(event.sender_id, file_id, item)
 
 
-@app.on_callback_query(filters.regex(r"^noop$"))
-async def noop(_, query: CallbackQuery):
-    await query.answer()
+@app.on(events.CallbackQuery(data=b"noop"))
+async def noop(event):
+    await event.answer()
 
 
-@app.on_message(filters.channel & (filters.document | filters.video | filters.audio), group=10)
-async def index_channel(_, message):
-    if message.chat.id != CHANNEL_ID:
-        return
-    print(f"📦 Channel media update received: chat_id={message.chat.id}, message_id={message.id}")
+@app.on(events.NewMessage(chats=CHANNEL_ID, incoming=True, func=lambda e: bool(e.message.document or e.message.video or e.message.audio)))
+async def index_channel(event):
+    message = event.message
+    print(f"📦 Channel media update received: chat_id={message.chat_id}, message_id={message.id}")
     await index_media_message(message)
 
 
-@app.on_message(filters.private, group=-100)
-async def diagnostic_private_update(_, message):
+@app.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+async def diagnostic_private_update(event):
     try:
-        user_id = message.from_user.id if message.from_user else "unknown"
-        print(f"📡 Telegram private update received: type={message.service or 'message'}, user_id={user_id}, message_id={message.id}")
+        print(f"📡 Telethon private update received: user_id={event.sender_id}, message_id={event.message.id}, text={event.raw_text[:80]!r}")
     except Exception as exc:
         print(f"⚠️ Diagnostic update logger failed: {exc}")
 
 
-@app.on_callback_query(group=-100)
-async def diagnostic_callback_update(_, query: CallbackQuery):
+@app.on(events.CallbackQuery())
+async def diagnostic_callback_update(event):
     try:
-        print(f"📡 Telegram callback received: user_id={query.from_user.id}, data={query.data!r}")
+        print(f"📡 Telethon callback received: user_id={event.sender_id}, data={event.data!r}")
     except Exception as exc:
         print(f"⚠️ Diagnostic callback logger failed: {exc}")
 
 
-@app.on_message(filters.channel, group=-99)
-async def diagnostic_channel_update(_, message):
+@app.on(events.NewMessage(chats=CHANNEL_ID, incoming=True))
+async def diagnostic_channel_update(event):
     try:
-        print(f"📡 Telegram channel update received: chat_id={message.chat.id}, message_id={message.id}")
+        print(f"📡 Telethon channel update received: chat_id={event.message.chat_id}, message_id={event.message.id}")
     except Exception as exc:
         print(f"⚠️ Diagnostic channel logger failed: {exc}")
 
@@ -464,7 +497,7 @@ async def diagnostic_channel_update(_, message):
 async def main():
     health_runner = None
     try:
-        print("🚀 Starting MOVIES_MAGIC_CLUB-3.0...")
+        print("🚀 Starting MOVIES_MAGIC_CLUB-3.0 with Telethon...")
         print("🔧 Initializing MongoDB...")
         await db.setup()
         print("✅ MongoDB initialized")
@@ -475,26 +508,24 @@ async def main():
 
         health_runner = await start_health_server()
 
-        print("🔌 Connecting Pyrogram to Telegram...")
-        await app.start()
-
+        print("🔌 Connecting Telethon to Telegram...")
+        await app.start(bot_token=BOT_TOKEN)
         me = await app.get_me()
         print(f"✅ Telegram connection established: @{me.username} (id={me.id})")
-        print("✅ Pyrogram update dispatcher is active")
+        print(f"✅ Telethon handlers registered: {len(app.list_event_handlers())}")
         print("🟢 Bot is ready to receive Telegram updates")
 
-        await asyncio.Event().wait()
+        await app.run_until_disconnected()
 
     except Exception as exc:
-        print(f"❌ Bot startup failed: {type(exc).__name__}: {exc}")
+        print(f"❌ Bot startup/runtime failed: {type(exc).__name__}: {exc}")
         raise
     finally:
         try:
-            if app.is_connected:
-                await app.stop()
+            if app.is_connected():
+                await app.disconnect()
         except Exception as exc:
-            print(f"⚠️ Bot stop failed: {exc}")
-
+            print(f"⚠️ Bot disconnect failed: {exc}")
         if health_runner:
             try:
                 await stop_health_server(health_runner)
