@@ -1,8 +1,10 @@
 import asyncio
 import math
+import os
 import re
 import time
 
+from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
@@ -22,6 +24,24 @@ app = Client("movies_magic_club", api_id=API_ID, api_hash=API_HASH, bot_token=BO
 db = Database(MONGO_URI, DATABASE_NAME)
 tmdb = TMDBClient(TMDB_API_KEY)
 verification = VerificationStore(db)
+
+
+async def health_check(_request):
+    return web.json_response({"status": "ok", "service": "movies-magic-club"})
+
+
+async def start_health_server():
+    """Expose a lightweight HTTP endpoint for Koyeb/container health checks."""
+    port = int(os.getenv("PORT", "8000"))
+    health_app = web.Application()
+    health_app.router.add_get("/", health_check)
+    health_app.router.add_get("/health", health_check)
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health server listening on 0.0.0.0:{port}")
+    return runner
 
 
 def page_count(total: int) -> int:
@@ -354,7 +374,13 @@ async def index_channel(_, message):
 
 
 async def main():
-    await db.setup(); await verification.setup(); await app.start(); me = await app.get_me(); print(f"@{me.username} is running"); await asyncio.Event().wait()
+    await db.setup()
+    await verification.setup()
+    await start_health_server()
+    await app.start()
+    me = await app.get_me()
+    print(f"@{me.username} is running")
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__": asyncio.run(main())
