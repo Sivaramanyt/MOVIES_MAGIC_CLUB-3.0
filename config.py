@@ -23,3 +23,9 @@ RESULTS_PER_PAGE = max(1, int(os.getenv("RESULTS_PER_PAGE", "8")))
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 TMDB_LANGUAGE = os.getenv("TMDB_LANGUAGE", "en-US").strip() or "en-US"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
+
+# Safe duplicate policy: all three fields must match after normalization.
+AUTO_DELETE_DUPLICATES = os.getenv("AUTO_DELETE_DUPLICATES", "true").strip().lower() in {"1", "true", "yes", "on"}
+DUPLICATE_REQUIRE_ALL_FIELDS = os.getenv("DUPLICATE_REQUIRE_ALL_FIELDS", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Reindex is a dry run by default. Deletion requires the explicit --delete flag.
+REINDEX_DRY_RUN = os.getenv("REINDEX_DRY_RUN", "true").strip().lower() in {"1", "true", "yes", "on"}
