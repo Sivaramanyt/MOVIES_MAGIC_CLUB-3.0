@@ -19,14 +19,18 @@ db = Database(MONGO_URI, DATABASE_NAME)
 tmdb = TMDBClient(TMDB_API_KEY)
 
 
+def page_count(total: int) -> int:
+    return max(1, math.ceil(total / RESULTS_PER_PAGE))
+
+
 def result_keyboard(query: str, page: int, total: int):
-    pages = max(1, math.ceil(total / RESULTS_PER_PAGE))
-    rows = []
+    pages = page_count(total)
+    row = []
     if page > 0:
-        rows.append([InlineKeyboardButton("⬅️ Previous", callback_data=f"search|{page-1}|{query[:40]}")])
+        row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"search|{page-1}|{query[:40]}"))
     if page + 1 < pages:
-        rows.append([InlineKeyboardButton("Next ➡️", callback_data=f"search|{page+1}|{query[:40]}")])
-    return InlineKeyboardMarkup(rows) if rows else None
+        row.append(InlineKeyboardButton("Next ➡️", callback_data=f"search|{page+1}|{query[:40]}"))
+    return InlineKeyboardMarkup([row]) if row else None
 
 
 def language_text(item: dict) -> str:
@@ -40,7 +44,6 @@ def format_card(item: dict) -> str:
     rating = item.get("rating")
     genres = item.get("genres") or []
     quality = item.get("quality")
-
     lines = [f"🎬 **{title}**"]
     details = []
     if year:
@@ -95,7 +98,7 @@ async def build_results(query: str, page: int):
     return total, enriched
 
 
-async def render_search(message, query: str, page: int = 0):
+async def send_result_cards(message, query: str, page: int = 0):
     query = query.strip()
     if not query:
         return await message.reply_text("🔎 Send a movie or series name.")
@@ -103,10 +106,8 @@ async def render_search(message, query: str, page: int = 0):
     if not total:
         return await message.reply_text(f"❌ No results found for **{query}**.", parse_mode=ParseMode.MARKDOWN)
 
-    # A real Telegram photo card is used when a TMDB poster exists. Each
-    # result is sent as a separate photo with its own file-selection button.
-    # If Telegram cannot fetch the poster, we gracefully fall back to text.
-    for i, item in enumerate(items, start=1):
+    pages = page_count(total)
+    for item in items:
         caption = format_card(item)
         button = InlineKeyboardMarkup([[InlineKeyboardButton(
             f"📥 Get {item.get('tmdb_title') or item.get('title', 'File')[:35]}",
@@ -124,7 +125,7 @@ async def render_search(message, query: str, page: int = 0):
     nav = result_keyboard(query, page, total)
     if nav:
         await message.reply_text(
-            f"🔎 **Results:** `{query}` • Page **{page + 1}/{max(1, math.ceil(total / RESULTS_PER_PAGE))}**",
+            f"📄 **Page {page + 1}/{pages}** • `{total}` results",
             reply_markup=nav,
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -165,15 +166,22 @@ async def search_handler(_, message):
     if not await subscribed(app, message.from_user.id):
         return await message.reply_text("🔒 Please join the required channel first.")
     await db.add_user(message.from_user.id)
-    await render_search(message, message.text)
+    await send_result_cards(message, message.text)
 
 
 @app.on_callback_query(filters.regex(r"^search\|"))
 async def page_callback(_, query: CallbackQuery):
     _, page, search = query.data.split("|", 2)
-    page = int(page)
-    await query.answer()
-    await render_search(query.message, search, page)
+    page = max(0, int(page))
+    total = await db.count_files(search)
+    pages = page_count(total)
+    page = min(page, pages - 1)
+    await query.answer(f"Loading page {page + 1}/{pages}…")
+    await send_result_cards(query.message, search, page)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
 
 
 @app.on_callback_query(filters.regex(r"^file\|"))
