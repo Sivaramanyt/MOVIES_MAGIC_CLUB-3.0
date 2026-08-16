@@ -20,3 +20,6 @@ CHANNEL_ID = int(required("CHANNEL_ID"))
 ADMINS = {int(x) for x in os.getenv("ADMINS", "").split() if x.strip().lstrip("-").isdigit()}
 FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "").strip()
 RESULTS_PER_PAGE = max(1, int(os.getenv("RESULTS_PER_PAGE", "8")))
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+TMDB_LANGUAGE = os.getenv("TMDB_LANGUAGE", "en-US").strip() or "en-US"
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
