@@ -86,38 +86,67 @@ async def enrich_item(item: dict) -> dict:
     return item
 
 
-async def index_media_message(message) -> bool:
-    media = message.document or message.video or message.audio
-    if not media:
-        return False
+async def build_file_data(message, media):
     name = getattr(media, "file_name", None) or message.caption or "Unknown"
     meta = parse_media(name, message.caption or "")
-    data = {
+    return {
         **meta,
         "file_id": media.file_id,
         "file_unique_id": media.file_unique_id,
         "file_name": name,
+        "duplicate_name": " ".join(name.strip().split()).casefold(),
         "size": getattr(media, "file_size", 0),
         "mime_type": getattr(media, "mime_type", ""),
         "message_id": message.id,
         "channel_id": message.chat.id,
     }
+
+
+async def delete_duplicate_channel_message(message, duplicate: dict, reason="duplicate"):
+    try:
+        await message.delete()
+        print(f"Deleted {reason}: message={message.id}, kept_file={duplicate.get('file_id')}")
+        return True
+    except Exception as exc:
+        print(f"Unable to delete duplicate channel message {message.id}: {exc}")
+        return False
+
+
+async def index_media_message(message) -> bool:
+    media = message.document or message.video or message.audio
+    if not media:
+        return False
+    data = await build_file_data(message, media)
+
+    duplicate = await db.find_duplicate_file(
+        data["file_name"], data["size"], data.get("quality"), data.get("file_unique_id")
+    )
+    if duplicate:
+        await delete_duplicate_channel_message(message, duplicate)
+        return False
+
     added = await db.add_file(data)
     if not added:
+        duplicate = await db.find_duplicate_file(
+            data["file_name"], data["size"], data.get("quality"), data.get("file_unique_id")
+        )
+        if duplicate:
+            await delete_duplicate_channel_message(message, duplicate)
         return False
+
     try:
-        enriched = await tmdb.enrich(meta.get("title", ""), meta.get("year"))
+        enriched = await tmdb.enrich(data.get("title", ""), data.get("year"))
         if enriched:
             await db.update_file_tmdb(data["file_id"], enriched)
             await db.save_movie(enriched)
     except Exception as exc:
-        print(f"TMDB enrichment failed for {name}: {exc}")
+        print(f"TMDB enrichment failed for {data['file_name']}: {exc}")
     return True
 
 
 async def reindex_channel(progress_callback=None) -> dict:
-    """Scan channel history and report live counters through progress_callback."""
-    stats = {"scanned": 0, "indexed": 0, "enriched": 0, "failed": 0, "last_message_id": 0}
+    """Scan channel history, remove duplicates, and index/enrich survivors."""
+    stats = {"scanned": 0, "indexed": 0, "enriched": 0, "failed": 0, "duplicates": 0, "last_message_id": 0}
     async for history_message in app.get_chat_history(CHANNEL_ID):
         media = history_message.document or history_message.video or history_message.audio
         if not media:
@@ -125,19 +154,18 @@ async def reindex_channel(progress_callback=None) -> dict:
         stats["scanned"] += 1
         stats["last_message_id"] = history_message.id
         try:
-            name = getattr(media, "file_name", None) or history_message.caption or "Unknown"
-            meta = parse_media(name, history_message.caption or "")
-            data = {
-                **meta,
-                "file_id": media.file_id,
-                "file_unique_id": media.file_unique_id,
-                "file_name": name,
-                "size": getattr(media, "file_size", 0),
-                "mime_type": getattr(media, "mime_type", ""),
-                "message_id": history_message.id,
-                "channel_id": history_message.chat.id,
-            }
+            data = await build_file_data(history_message, media)
             existing = await db.files.find_one({"file_unique_id": media.file_unique_id})
+            duplicate = await db.find_duplicate_file(
+                data["file_name"], data["size"], data.get("quality"), data.get("file_unique_id")
+            )
+            if duplicate and (not existing or duplicate.get("file_id") != existing.get("file_id")):
+                if await delete_duplicate_channel_message(history_message, duplicate, "reindex duplicate"):
+                    stats["duplicates"] += 1
+                if existing:
+                    await db.files.delete_one({"file_id": existing["file_id"]})
+                continue
+
             if existing:
                 await db.update_file(existing["file_id"], data)
                 file_id = existing["file_id"]
@@ -147,7 +175,7 @@ async def reindex_channel(progress_callback=None) -> dict:
                 file_id = data["file_id"]
             stats["indexed"] += 1
 
-            metadata = await tmdb.enrich(meta.get("title", ""), meta.get("year"))
+            metadata = await tmdb.enrich(data.get("title", ""), data.get("year"))
             if metadata:
                 await db.update_file_tmdb(file_id, metadata)
                 await db.save_movie(metadata)
@@ -166,6 +194,7 @@ def format_reindex_progress(stats: dict, started_at: float, running: bool = True
     indexed = stats["indexed"]
     enriched = stats["enriched"]
     failed = stats["failed"]
+    duplicates = stats.get("duplicates", 0)
     elapsed = max(time.monotonic() - started_at, 0.1)
     rate = scanned / elapsed
     state = "🔄 **Reindexing…**" if running else "✅ **Reindex complete**"
@@ -174,6 +203,7 @@ def format_reindex_progress(stats: dict, started_at: float, running: bool = True
         f"📦 Scanned: `{scanned}`\n"
         f"🗂 Indexed: `{indexed}`\n"
         f"🧩 Enriched: `{enriched}`\n"
+        f"♻️ Duplicates removed: `{duplicates}`\n"
         f"⚠️ Failed: `{failed}`\n"
         f"⚡ Speed: `{rate:.1f} files/s`\n"
         f"🆔 Last message: `{stats.get('last_message_id', 0)}`"
@@ -299,19 +329,16 @@ async def stats(_, message):
 async def reindex_cmd(_, message):
     if message.from_user.id not in ADMINS:
         return await message.reply_text("⛔ You are not authorized to use this command.")
-
     started_at = time.monotonic()
     last_update = 0.0
     status = await message.reply_text(
-        "🔄 **Reindexing…**\n\n📦 Scanned: `0`\n🗂 Indexed: `0`\n🧩 Enriched: `0`\n⚠️ Failed: `0`\n⚡ Speed: `0.0 files/s`",
+        "🔄 **Reindexing…**\n\n📦 Scanned: `0`\n🗂 Indexed: `0`\n🧩 Enriched: `0`\n♻️ Duplicates removed: `0`\n⚠️ Failed: `0`\n⚡ Speed: `0.0 files/s`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     async def progress(stats: dict):
         nonlocal last_update
         now = time.monotonic()
-        # Telegram rate limits make per-file edits noisy. Update at most every
-        # 3 seconds, plus immediately on the first processed file.
         if stats["scanned"] != 1 and now - last_update < 3:
             return
         last_update = now
