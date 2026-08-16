@@ -3,7 +3,7 @@ import math
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, InputMediaPhoto
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from pyrogram.errors import UserNotParticipant
 
 from config import (
@@ -34,12 +34,11 @@ def language_text(item: dict) -> str:
     return ", ".join(x.title() for x in languages) if languages else "Not specified"
 
 
-def format_card(item: dict, metadata: dict | None = None) -> str:
-    metadata = metadata or {}
-    title = metadata.get("tmdb_title") or item.get("title") or "Unknown"
-    year = metadata.get("year") or item.get("year")
-    rating = metadata.get("rating")
-    genres = metadata.get("genres") or []
+def format_card(item: dict) -> str:
+    title = item.get("tmdb_title") or item.get("title") or "Unknown"
+    year = item.get("tmdb_year") or item.get("year")
+    rating = item.get("rating")
+    genres = item.get("genres") or []
     quality = item.get("quality")
 
     lines = [f"🎬 **{title}**"]
@@ -68,6 +67,7 @@ async def enrich_item(item: dict) -> dict:
     metadata["genres"] = [genres[x] for x in metadata.get("genre_ids", []) if x in genres]
     await db.update_file_tmdb(item["file_id"], metadata)
     item.update(metadata)
+    item["tmdb_year"] = metadata.get("year")
     return item
 
 
@@ -103,18 +103,31 @@ async def render_search(message, query: str, page: int = 0):
     if not total:
         return await message.reply_text(f"❌ No results found for **{query}**.", parse_mode=ParseMode.MARKDOWN)
 
-    text = [f"🔎 **Results for:** `{query}`", f"📚 Found: **{total}**", ""]
-    buttons = []
+    # A real Telegram photo card is used when a TMDB poster exists. Each
+    # result is sent as a separate photo with its own file-selection button.
+    # If Telegram cannot fetch the poster, we gracefully fall back to text.
     for i, item in enumerate(items, start=1):
-        text.append(f"**{i}.** {format_card(item)}")
-        buttons.append([InlineKeyboardButton(
-            f"📥 {i}. {item.get('tmdb_title') or item.get('title', 'File')[:35]}",
+        caption = format_card(item)
+        button = InlineKeyboardMarkup([[InlineKeyboardButton(
+            f"📥 Get {item.get('tmdb_title') or item.get('title', 'File')[:35]}",
             callback_data=f"file|{item['file_id']}"
-        )])
+        )]])
+        poster = item.get("poster_url")
+        if poster:
+            try:
+                await message.reply_photo(photo=poster, caption=caption, reply_markup=button, parse_mode=ParseMode.MARKDOWN)
+                continue
+            except Exception:
+                pass
+        await message.reply_text(caption, reply_markup=button, parse_mode=ParseMode.MARKDOWN)
+
     nav = result_keyboard(query, page, total)
     if nav:
-        buttons.extend(nav.inline_keyboard)
-    return await message.reply_text("\n\n".join(text), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
+        await message.reply_text(
+            f"🔎 **Results:** `{query}` • Page **{page + 1}/{max(1, math.ceil(total / RESULTS_PER_PAGE))}**",
+            reply_markup=nav,
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 @app.on_message(filters.command("start") & filters.private)
@@ -159,20 +172,8 @@ async def search_handler(_, message):
 async def page_callback(_, query: CallbackQuery):
     _, page, search = query.data.split("|", 2)
     page = int(page)
-    total, items = await build_results(search, page)
-    text = [f"🔎 **Results for:** `{search}`", f"📚 Found: **{total}**", ""]
-    buttons = []
-    for i, item in enumerate(items, start=1):
-        text.append(f"**{i}.** {format_card(item)}")
-        buttons.append([InlineKeyboardButton(
-            f"📥 {i}. {item.get('tmdb_title') or item.get('title', 'File')[:35]}",
-            callback_data=f"file|{item['file_id']}"
-        )])
-    nav = result_keyboard(search, page, total)
-    if nav:
-        buttons.extend(nav.inline_keyboard)
-    await query.message.edit_text("\n\n".join(text), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
     await query.answer()
+    await render_search(query.message, search, page)
 
 
 @app.on_callback_query(filters.regex(r"^file\|"))
@@ -186,8 +187,7 @@ async def file_callback(_, query: CallbackQuery):
     except Exception:
         pass
     await query.answer("Sending file…")
-    caption = format_card(item)
-    await app.send_cached_media(query.from_user.id, file_id, caption=caption)
+    await app.send_cached_media(query.from_user.id, file_id, caption=format_card(item))
 
 
 @app.on_message(filters.channel & (filters.document | filters.video | filters.audio), group=10)
