@@ -1,5 +1,6 @@
 import asyncio
 import math
+import time
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -114,14 +115,15 @@ async def index_media_message(message) -> bool:
     return True
 
 
-async def reindex_channel() -> tuple[int, int, int]:
-    """Scan channel history and repair/index every supported media record."""
-    scanned = indexed = failed = 0
+async def reindex_channel(progress_callback=None) -> dict:
+    """Scan channel history and report live counters through progress_callback."""
+    stats = {"scanned": 0, "indexed": 0, "enriched": 0, "failed": 0, "last_message_id": 0}
     async for history_message in app.get_chat_history(CHANNEL_ID):
         media = history_message.document or history_message.video or history_message.audio
         if not media:
             continue
-        scanned += 1
+        stats["scanned"] += 1
+        stats["last_message_id"] = history_message.id
         try:
             name = getattr(media, "file_name", None) or history_message.caption or "Unknown"
             meta = parse_media(name, history_message.caption or "")
@@ -143,18 +145,39 @@ async def reindex_channel() -> tuple[int, int, int]:
                 if not await db.add_file(data):
                     continue
                 file_id = data["file_id"]
+            stats["indexed"] += 1
 
-            # Always attempt enrichment during reindex so legacy records missing
-            # TMDB data are migrated into the same movie groups as new uploads.
             metadata = await tmdb.enrich(meta.get("title", ""), meta.get("year"))
             if metadata:
                 await db.update_file_tmdb(file_id, metadata)
                 await db.save_movie(metadata)
-            indexed += 1
+                stats["enriched"] += 1
         except Exception as exc:
-            failed += 1
+            stats["failed"] += 1
             print(f"Reindex failed for message {getattr(history_message, 'id', '?')}: {exc}")
-    return scanned, indexed, failed
+
+        if progress_callback:
+            await progress_callback(dict(stats))
+    return stats
+
+
+def format_reindex_progress(stats: dict, started_at: float, running: bool = True) -> str:
+    scanned = stats["scanned"]
+    indexed = stats["indexed"]
+    enriched = stats["enriched"]
+    failed = stats["failed"]
+    elapsed = max(time.monotonic() - started_at, 0.1)
+    rate = scanned / elapsed
+    state = "🔄 **Reindexing…**" if running else "✅ **Reindex complete**"
+    return (
+        f"{state}\n\n"
+        f"📦 Scanned: `{scanned}`\n"
+        f"🗂 Indexed: `{indexed}`\n"
+        f"🧩 Enriched: `{enriched}`\n"
+        f"⚠️ Failed: `{failed}`\n"
+        f"⚡ Speed: `{rate:.1f} files/s`\n"
+        f"🆔 Last message: `{stats.get('last_message_id', 0)}`"
+    )
 
 
 async def subscribed(client, user_id: int) -> bool:
@@ -276,16 +299,30 @@ async def stats(_, message):
 async def reindex_cmd(_, message):
     if message.from_user.id not in ADMINS:
         return await message.reply_text("⛔ You are not authorized to use this command.")
-    status = await message.reply_text("🔄 **Reindex started**\nScanning existing channel history…", parse_mode=ParseMode.MARKDOWN)
+
+    started_at = time.monotonic()
+    last_update = 0.0
+    status = await message.reply_text(
+        "🔄 **Reindexing…**\n\n📦 Scanned: `0`\n🗂 Indexed: `0`\n🧩 Enriched: `0`\n⚠️ Failed: `0`\n⚡ Speed: `0.0 files/s`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    async def progress(stats: dict):
+        nonlocal last_update
+        now = time.monotonic()
+        # Telegram rate limits make per-file edits noisy. Update at most every
+        # 3 seconds, plus immediately on the first processed file.
+        if stats["scanned"] != 1 and now - last_update < 3:
+            return
+        last_update = now
+        try:
+            await status.edit_text(format_reindex_progress(stats, started_at), parse_mode=ParseMode.MARKDOWN)
+        except Exception as exc:
+            print(f"Reindex progress update failed: {exc}")
+
     try:
-        scanned, indexed, failed = await reindex_channel()
-        await status.edit_text(
-            "✅ **Reindex complete**\n\n"
-            f"📦 Media scanned: `{scanned}`\n"
-            f"🗂 Indexed/enriched: `{indexed}`\n"
-            f"⚠️ Failed: `{failed}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        final = await reindex_channel(progress)
+        await status.edit_text(format_reindex_progress(final, started_at, running=False), parse_mode=ParseMode.MARKDOWN)
     except Exception as exc:
         await status.edit_text(f"❌ **Reindex failed**\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
 
