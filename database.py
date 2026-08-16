@@ -15,8 +15,9 @@ class Database:
         await self.files.create_index([("search_text", "text")])
         await self.files.create_index("title")
         await self.files.create_index("tmdb_id")
-        await self.movies.create_index("tmdb_id", unique=True)
-        await self.movies.create_index("normalized_title")
+        await self.files.create_index([("normalized_title", 1), ("year", 1)])
+        await self.movies.create_index("tmdb_id", unique=True, sparse=True)
+        await self.movies.create_index([("normalized_title", 1), ("year", 1)])
         await self.users.create_index("user_id", unique=True)
 
     async def add_user(self, user_id: int):
@@ -44,6 +45,94 @@ class Database:
         safe = query.replace(".", r"\.").replace("*", "").strip()
         regex = {"$regex": safe, "$options": "i"}
         return await self.files.count_documents({"search_text": regex})
+
+    async def find_grouped_movies(self, query: str, skip: int, limit: int):
+        """Return one representative movie document per logical movie.
+
+        TMDB ID is the strongest key. For files without a TMDB match, title+year
+        is used. The first representative is sorted newest-first so its poster
+        and metadata can be used for the movie card.
+        """
+        safe = query.replace(".", r"\.").replace("*", "").strip()
+        regex = {"$regex": safe, "$options": "i"}
+        pipeline = [
+            {"$match": {"search_text": regex}},
+            {"$addFields": {
+                "group_key": {
+                    "$cond": [
+                        {"$and": [
+                            {"$ne": [{"$ifNull": ["$tmdb_id", None]}, None]},
+                            {"$ne": [{"$ifNull": ["$tmdb_id", None]}, ""]}
+                        ]},
+                        {"$concat": ["tmdb:", {"$toString": "$tmdb_id"}]},
+                        {"$concat": [
+                            "title:",
+                            {"$toLower": {"$ifNull": ["$normalized_title", "$title"]}},
+                            ":year:",
+                            {"$toString": {"$ifNull": ["$year", 0]}}
+                        ]
+                    ]
+                }
+            }},
+            {"$sort": {"_id": -1}},
+            {"$group": {
+                "_id": "$group_key",
+                "representative": {"$first": "$$ROOT"},
+                "file_ids": {"$push": "$file_id"},
+                "languages": {"$addToSet": "$languages"},
+                "qualities": {"$addToSet": "$quality"}
+            }},
+            {"$sort": {"representative._id": -1}},
+            {"$skip": skip},
+            {"$limit": limit}
+        ]
+        rows = await self.files.aggregate(pipeline).to_list(length=limit)
+        for row in rows:
+            rep = row["representative"]
+            langs = sorted({x for group in row.get("languages", []) if group for x in group})
+            quals = sorted({x for x in row.get("qualities", []) if x})
+            rep["group_file_ids"] = row.get("file_ids", [])
+            rep["group_languages"] = langs
+            rep["group_qualities"] = quals
+            row["representative"] = rep
+        return rows
+
+    async def count_grouped_movies(self, query: str) -> int:
+        safe = query.replace(".", r"\.").replace("*", "").strip()
+        regex = {"$regex": safe, "$options": "i"}
+        pipeline = [
+            {"$match": {"search_text": regex}},
+            {"$addFields": {
+                "group_key": {
+                    "$cond": [
+                        {"$and": [
+                            {"$ne": [{"$ifNull": ["$tmdb_id", None]}, None]},
+                            {"$ne": [{"$ifNull": ["$tmdb_id", None]}, ""]}
+                        ]},
+                        {"$concat": ["tmdb:", {"$toString": "$tmdb_id"}]},
+                        {"$concat": [
+                            "title:",
+                            {"$toLower": {"$ifNull": ["$normalized_title", "$title"]}},
+                            ":year:",
+                            {"$toString": {"$ifNull": ["$year", 0]}}
+                        ]
+                    ]
+                }
+            }},
+            {"$group": {"_id": "$group_key"}},
+            {"$count": "total"}
+        ]
+        rows = await self.files.aggregate(pipeline).to_list(length=1)
+        return rows[0]["total"] if rows else 0
+
+    async def get_movie_files(self, representative: dict):
+        tmdb_id = representative.get("tmdb_id")
+        if tmdb_id:
+            return await self.files.find({"tmdb_id": tmdb_id}).sort([("quality", 1), ("_id", -1)]).to_list(length=500)
+        return await self.files.find({
+            "normalized_title": representative.get("normalized_title"),
+            "year": representative.get("year")
+        }).sort([("quality", 1), ("_id", -1)]).to_list(length=500)
 
     async def get_movie(self, tmdb_id: int):
         return await self.movies.find_one({"tmdb_id": tmdb_id})
