@@ -36,11 +36,6 @@ def poster_keyboard(query: str, page: int, total: int, group_key: str):
     return InlineKeyboardMarkup(rows)
 
 
-def language_text(item: dict) -> str:
-    languages = item.get("group_languages") or item.get("languages") or []
-    return ", ".join(x.title() for x in languages) if languages else "Not specified"
-
-
 def movie_card(item: dict) -> str:
     title = item.get("tmdb_title") or item.get("title") or "Unknown"
     year = item.get("tmdb_year") or item.get("year")
@@ -91,7 +86,6 @@ async def enrich_item(item: dict) -> dict:
 
 
 async def index_media_message(message) -> bool:
-    """Parse, TMDB-enrich and store one new channel media item immediately."""
     media = message.document or message.video or message.audio
     if not media:
         return False
@@ -107,12 +101,9 @@ async def index_media_message(message) -> bool:
         "message_id": message.id,
         "channel_id": message.chat.id,
     }
-
-    # Insert first so the Telegram file is never lost if TMDB is temporarily unavailable.
     added = await db.add_file(data)
     if not added:
         return False
-
     try:
         enriched = await tmdb.enrich(meta.get("title", ""), meta.get("year"))
         if enriched:
@@ -121,6 +112,49 @@ async def index_media_message(message) -> bool:
     except Exception as exc:
         print(f"TMDB enrichment failed for {name}: {exc}")
     return True
+
+
+async def reindex_channel() -> tuple[int, int, int]:
+    """Scan channel history and repair/index every supported media record."""
+    scanned = indexed = failed = 0
+    async for history_message in app.get_chat_history(CHANNEL_ID):
+        media = history_message.document or history_message.video or history_message.audio
+        if not media:
+            continue
+        scanned += 1
+        try:
+            name = getattr(media, "file_name", None) or history_message.caption or "Unknown"
+            meta = parse_media(name, history_message.caption or "")
+            data = {
+                **meta,
+                "file_id": media.file_id,
+                "file_unique_id": media.file_unique_id,
+                "file_name": name,
+                "size": getattr(media, "file_size", 0),
+                "mime_type": getattr(media, "mime_type", ""),
+                "message_id": history_message.id,
+                "channel_id": history_message.chat.id,
+            }
+            existing = await db.files.find_one({"file_unique_id": media.file_unique_id})
+            if existing:
+                await db.update_file(existing["file_id"], data)
+                file_id = existing["file_id"]
+            else:
+                if not await db.add_file(data):
+                    continue
+                file_id = data["file_id"]
+
+            # Always attempt enrichment during reindex so legacy records missing
+            # TMDB data are migrated into the same movie groups as new uploads.
+            metadata = await tmdb.enrich(meta.get("title", ""), meta.get("year"))
+            if metadata:
+                await db.update_file_tmdb(file_id, metadata)
+                await db.save_movie(metadata)
+            indexed += 1
+        except Exception as exc:
+            failed += 1
+            print(f"Reindex failed for message {getattr(history_message, 'id', '?')}: {exc}")
+    return scanned, indexed, failed
 
 
 async def subscribed(client, user_id: int) -> bool:
@@ -141,7 +175,6 @@ async def build_results(query: str, page: int):
     items = []
     for row in rows:
         item = row["representative"]
-        # Existing legacy records are enriched lazily; newly indexed files are already enriched.
         try:
             item = await enrich_item(item)
         except Exception:
@@ -186,7 +219,6 @@ async def show_movie_options(message, selected: dict):
             await enrich_item(item)
         except Exception:
             pass
-
     title = selected.get("tmdb_title") or selected.get("title") or "Movie"
     year = selected.get("tmdb_year") or selected.get("year")
     languages = sorted({x for f in files for x in (f.get("languages") or [])})
@@ -194,7 +226,6 @@ async def show_movie_options(message, selected: dict):
     if year:
         lines.append(f"📅 {year}")
     lines.append("\n🌐 **Select Language**")
-
     rows = []
     for i in range(0, len(languages), 2):
         rows.append([InlineKeyboardButton(lang.title(), callback_data=f"lang|{selected.get('tmdb_id', '')}|{lang}") for lang in languages[i:i + 2]])
@@ -230,7 +261,7 @@ async def start(_, message):
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_cmd(_, message):
-    await message.reply_text("🔎 Send a movie/series name to search.\n\nAdmins: `/stats`", parse_mode=ParseMode.MARKDOWN)
+    await message.reply_text("🔎 Send a movie/series name to search.\n\nAdmins: `/stats`\n🔄 Admin: `/reindex`", parse_mode=ParseMode.MARKDOWN)
 
 
 @app.on_message(filters.command("stats") & filters.private)
@@ -241,7 +272,25 @@ async def stats(_, message):
     await message.reply_text(f"📊 **Stats**\n\n📁 Files: `{files}`\n👤 Users: `{users}`\n🎬 TMDB movies: `{movies}`", parse_mode=ParseMode.MARKDOWN)
 
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "help", "stats", "cancel"]))
+@app.on_message(filters.command("reindex") & filters.private)
+async def reindex_cmd(_, message):
+    if message.from_user.id not in ADMINS:
+        return await message.reply_text("⛔ You are not authorized to use this command.")
+    status = await message.reply_text("🔄 **Reindex started**\nScanning existing channel history…", parse_mode=ParseMode.MARKDOWN)
+    try:
+        scanned, indexed, failed = await reindex_channel()
+        await status.edit_text(
+            "✅ **Reindex complete**\n\n"
+            f"📦 Media scanned: `{scanned}`\n"
+            f"🗂 Indexed/enriched: `{indexed}`\n"
+            f"⚠️ Failed: `{failed}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:
+        await status.edit_text(f"❌ **Reindex failed**\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "help", "stats", "reindex", "cancel"]))
 async def search_handler(_, message):
     if not await subscribed(app, message.from_user.id):
         return await message.reply_text("🔒 Please join the required channel first.")
