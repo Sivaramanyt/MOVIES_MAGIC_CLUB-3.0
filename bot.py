@@ -81,15 +81,46 @@ def file_card(item: dict) -> str:
 async def enrich_item(item: dict) -> dict:
     if item.get("tmdb_id") and item.get("tmdb_title"):
         return item
-    metadata = await tmdb.search(item.get("title", ""), item.get("year"))
+    metadata = await tmdb.enrich(item.get("title", ""), item.get("year"))
     if not metadata:
         return item
-    genres = await tmdb.genres(metadata.get("media_type", "movie"))
-    metadata["genres"] = [genres[x] for x in metadata.get("genre_ids", []) if x in genres]
     await db.update_file_tmdb(item["file_id"], metadata)
+    await db.save_movie(metadata)
     item.update(metadata)
-    item["tmdb_year"] = metadata.get("year")
     return item
+
+
+async def index_media_message(message) -> bool:
+    """Parse, TMDB-enrich and store one new channel media item immediately."""
+    media = message.document or message.video or message.audio
+    if not media:
+        return False
+    name = getattr(media, "file_name", None) or message.caption or "Unknown"
+    meta = parse_media(name, message.caption or "")
+    data = {
+        **meta,
+        "file_id": media.file_id,
+        "file_unique_id": media.file_unique_id,
+        "file_name": name,
+        "size": getattr(media, "file_size", 0),
+        "mime_type": getattr(media, "mime_type", ""),
+        "message_id": message.id,
+        "channel_id": message.chat.id,
+    }
+
+    # Insert first so the Telegram file is never lost if TMDB is temporarily unavailable.
+    added = await db.add_file(data)
+    if not added:
+        return False
+
+    try:
+        enriched = await tmdb.enrich(meta.get("title", ""), meta.get("year"))
+        if enriched:
+            await db.update_file_tmdb(data["file_id"], enriched)
+            await db.save_movie(enriched)
+    except Exception as exc:
+        print(f"TMDB enrichment failed for {name}: {exc}")
+    return True
 
 
 async def subscribed(client, user_id: int) -> bool:
@@ -110,18 +141,16 @@ async def build_results(query: str, page: int):
     items = []
     for row in rows:
         item = row["representative"]
+        # Existing legacy records are enriched lazily; newly indexed files are already enriched.
         try:
             item = await enrich_item(item)
         except Exception:
             pass
-        # Recalculate the group after enrichment so files that receive the same
-        # TMDB ID can be represented consistently on subsequent searches.
         items.append(item)
     return total, items
 
 
 async def send_movie_card(message, item: dict, query: str, page: int, total: int):
-    # TMDB ID is preferred. For unmatched files, title+year is the fallback key.
     if item.get("tmdb_id"):
         group_key = f"tmdb:{item['tmdb_id']}"
     else:
@@ -149,7 +178,6 @@ async def render_search(message, query: str, page: int = 0):
 
 
 async def show_movie_options(message, selected: dict):
-    """Step 2: combine all files belonging to the selected movie."""
     files = await db.get_movie_files(selected)
     if not files:
         files = [selected]
@@ -169,10 +197,7 @@ async def show_movie_options(message, selected: dict):
 
     rows = []
     for i in range(0, len(languages), 2):
-        rows.append([
-            InlineKeyboardButton(lang.title(), callback_data=f"lang|{selected.get('tmdb_id', '')}|{lang}")
-            for lang in languages[i:i + 2]
-        ])
+        rows.append([InlineKeyboardButton(lang.title(), callback_data=f"lang|{selected.get('tmdb_id', '')}|{lang}") for lang in languages[i:i + 2]])
     if not rows:
         rows = [[InlineKeyboardButton("🌐 All Languages", callback_data=f"lang|{selected.get('tmdb_id', '')}|all")]]
     return await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN)
@@ -307,20 +332,7 @@ async def noop(_, query: CallbackQuery):
 async def index_channel(_, message):
     if message.chat.id != CHANNEL_ID:
         return
-    media = message.document or message.video or message.audio
-    name = getattr(media, "file_name", None) or message.caption or "Unknown"
-    meta = parse_media(name, message.caption or "")
-    data = {
-        **meta,
-        "file_id": media.file_id,
-        "file_unique_id": media.file_unique_id,
-        "file_name": name,
-        "size": getattr(media, "file_size", 0),
-        "mime_type": getattr(media, "mime_type", ""),
-        "message_id": message.id,
-        "channel_id": message.chat.id,
-    }
-    await db.add_file(data)
+    await index_media_message(message)
 
 
 async def main():
