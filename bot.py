@@ -17,6 +17,7 @@ from database import Database
 from parser import parse_media
 from tmdb import TMDBClient
 from shortlink_verification import VerificationStore, maybe_create_verification, CONFIG as VERIFICATION_CONFIG
+from health_server import start_health_server
 
 app = Client("movies_magic_club", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 db = Database(MONGO_URI, DATABASE_NAME)
@@ -354,7 +355,37 @@ async def index_channel(_, message):
 
 
 async def main():
-    await db.setup(); await verification.setup(); await app.start(); me = await app.get_me(); print(f"@{me.username} is running"); await asyncio.Event().wait()
+    health_runner = None
+
+    try:
+        await db.setup()
+        await verification.setup()
+
+        health_runner = await start_health_server()
+
+        await app.start()
+
+        me = await app.get_me()
+        print(f"@{me.username} is running")
+
+        await asyncio.Event().wait()
+
+    except Exception as exc:
+        print(f"❌ Bot startup failed: {exc}")
+        raise
+
+    finally:
+        try:
+            await app.stop()
+        except Exception:
+            pass
+
+        if health_runner:
+            try:
+                await stop_health_server(health_runner)
+            except Exception:
+                pass
 
 
-if __name__ == "__main__": asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
