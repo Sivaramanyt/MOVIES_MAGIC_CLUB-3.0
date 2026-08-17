@@ -1,3 +1,4 @@
+import difflib
 import re
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -81,9 +82,9 @@ class Database:
         return await self.files.count_documents({"search_text": regex})
 
     @staticmethod
-    def _group_pipeline(regex: dict):
+    def _group_pipeline(match: dict):
         return [
-            {"$match": {"search_text": regex}},
+            {"$match": match},
             {
                 "$addFields": {
                     "group_key": {
@@ -111,7 +112,7 @@ class Database:
 
     async def find_grouped_movies(self, query: str, skip: int, limit: int):
         regex = _search_regex(query)
-        pipeline = self._group_pipeline(regex) + [
+        pipeline = self._group_pipeline({"search_text": regex}) + [
             {"$sort": {"_id": -1}},
             {
                 "$group": {
@@ -139,7 +140,7 @@ class Database:
 
     async def count_grouped_movies(self, query: str) -> int:
         regex = _search_regex(query)
-        pipeline = self._group_pipeline(regex) + [
+        pipeline = self._group_pipeline({"search_text": regex}) + [
             {"$group": {"_id": "$group_key"}},
             {"$count": "total"},
         ]
@@ -165,6 +166,49 @@ class Database:
                 {"$set": metadata},
                 upsert=True,
             )
+
+    async def find_grouped_by_titles(self, titles: list, skip: int, limit: int):
+        pipeline = self._group_pipeline({"normalized_title": {"$in": titles}}) + [
+            {"$sort": {"_id": -1}},
+            {
+                "$group": {
+                    "_id": "$group_key",
+                    "representative": {"$first": "$$ROOT"},
+                    "file_ids": {"$push": "$file_id"},
+                    "languages": {"$addToSet": "$languages"},
+                    "qualities": {"$addToSet": "$quality"},
+                }
+            },
+            {"$sort": {"representative._id": -1}},
+            {"$skip": skip},
+            {"$limit": limit},
+        ]
+        rows = await self.files.aggregate(pipeline).to_list(length=limit)
+        for row in rows:
+            rep = row["representative"]
+            langs = sorted({x for group in row.get("languages", []) if group for x in group})
+            quals = sorted({x for x in row.get("qualities", []) if x})
+            rep["group_file_ids"] = row.get("file_ids", [])
+            rep["group_languages"] = langs
+            rep["group_qualities"] = quals
+            row["representative"] = rep
+        return rows
+
+    async def count_grouped_by_titles(self, titles: list) -> int:
+        pipeline = self._group_pipeline({"normalized_title": {"$in": titles}}) + [
+            {"$group": {"_id": "$group_key"}},
+            {"$count": "total"},
+        ]
+        rows = await self.files.aggregate(pipeline).to_list(length=1)
+        return rows[0]["total"] if rows else 0
+
+    async def fuzzy_match_titles(self, query: str, limit: int = 8, cutoff: float = 0.6) -> list:
+        # Closest normalized_title matches for misspelled/approximate queries.
+        normalized = normalize_search_text(query)
+        if not normalized:
+            return []
+        titles = [t for t in await self.files.distinct("normalized_title") if t]
+        return difflib.get_close_matches(normalized, titles, n=limit, cutoff=cutoff)
 
     async def normalize_search_index(self) -> dict:
         """Recompute search_text/normalized_title for existing records.

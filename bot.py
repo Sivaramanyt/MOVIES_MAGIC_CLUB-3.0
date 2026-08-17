@@ -111,23 +111,50 @@ async def enrich_item(item: dict) -> dict:
     return item
 
 
+def is_legacy_record(doc: dict) -> bool:
+    """A record is only healthy if it carries a Telethon channel source
+    reference (``telethon:<channel_id>:<message_id>``). Anything else — old
+    Pyrogram file IDs, raw Telethon media IDs — is not deliverable and must
+    be migrated onto the real channel message when it is seen again."""
+    file_id = doc.get("file_id")
+    return not (
+        isinstance(file_id, str)
+        and file_id.startswith("telethon:")
+        and doc.get("channel_id")
+        and doc.get("message_id")
+    )
+
+
+async def enrich_file_record(file_id: str, data: dict):
+    try:
+        metadata = await tmdb.enrich(data.get("title", ""), data.get("year"))
+        if metadata:
+            await db.update_file_tmdb(file_id, metadata)
+            await db.save_movie(metadata)
+            print(f"🎬 TMDB enriched: message={data.get('message_id')}, tmdb_id={metadata.get('tmdb_id')}")
+        else:
+            print(f"ℹ️ TMDB no match: message={data.get('message_id')}, title={data.get('title')!r}")
+    except Exception as exc:
+        print(f"⚠️ TMDB failed: message={data.get('message_id')}: {type(exc).__name__}: {exc}")
+
+
 async def build_file_data(message):
-    media = message.document or message.video or message.audio
     file = message.file
     name = (file.name if file else None) or message.raw_text or "Unknown"
     meta = parse_media(name, message.raw_text or "")
-    file_id = file.id if file else None
-    unique_id = str(file_id) if file_id is not None else str(message.id)
+    chat_id = int(message.chat_id) if message.chat_id is not None else CHANNEL_ID
+    message_id = int(message.id)
+    source_ref = f"telethon:{chat_id}:{message_id}"
     return {
         **meta,
-        "file_id": file_id,
-        "file_unique_id": unique_id,
+        "file_id": source_ref,
+        "file_unique_id": source_ref,
         "file_name": name,
         "duplicate_name": normalize_filename(name),
         "size": getattr(file, "size", 0) or 0,
         "mime_type": getattr(file, "mime_type", "") or "",
-        "message_id": message.id,
-        "channel_id": message.chat_id,
+        "message_id": message_id,
+        "channel_id": chat_id,
     }
 
 
@@ -147,48 +174,50 @@ async def find_safe_duplicate(data: dict):
     return await db.find_duplicate_file(data["file_name"], int(data["size"]), data.get("quality"), data.get("file_unique_id"))
 
 
-async def index_media_message(message) -> bool:
+async def index_media_message(message, source="event") -> bool:
     if not (message.document or message.video or message.audio):
         return False
-    data = await build_file_data(message)
-    if not data.get("file_id"):
-        return False
-    duplicate = await find_safe_duplicate(data)
-    if duplicate and not (duplicate.get("channel_id") and duplicate.get("message_id")):
-        # Legacy record without a Telegram source reference: adopt this real
-        # channel message instead of skipping (or deleting) it.
-        try:
-            await db.files.update_one({"file_id": duplicate["file_id"]}, {"$set": data})
-        except Exception as exc:
-            # e.g. this message is already indexed under the same source ref
-            print(f"Legacy record migration skipped for message {message.id}: {exc}")
-            return False
-        print(f"🔁 Migrated legacy record for message {message.id}: {data.get('file_name')!r}")
-        try:
-            enriched = await tmdb.enrich(data.get("title", ""), data.get("year"))
-            if enriched:
-                await db.update_file_tmdb(data["file_id"], enriched)
-                await db.save_movie(enriched)
-        except Exception as exc:
-            print(f"TMDB enrichment failed for {data['file_name']}: {exc}")
-        return True
-    if duplicate and AUTO_DELETE_DUPLICATES:
-        await delete_duplicate_channel_message(message, duplicate)
-        return False
-    if duplicate:
-        print(f"Duplicate detected but deletion disabled: message={message.id}")
-        return False
-    added = await db.add_file(data)
-    if not added:
-        return False
     try:
-        enriched = await tmdb.enrich(data.get("title", ""), data.get("year"))
-        if enriched:
-            await db.update_file_tmdb(data["file_id"], enriched)
-            await db.save_movie(enriched)
+        data = await build_file_data(message)
+        existing = await db.files.find_one({"file_unique_id": data["file_unique_id"]})
+        if existing:
+            await db.update_file(existing["file_id"], {
+                "file_name": data["file_name"], "message_id": data["message_id"],
+                "channel_id": data["channel_id"], "size": data["size"],
+                "mime_type": data["mime_type"], "search_text": data["search_text"],
+                "normalized_title": data.get("normalized_title"),
+                "title": data["title"], "year": data["year"],
+                "season": data.get("season"), "episode": data.get("episode"),
+                "quality": data["quality"], "languages": data["languages"]})
+            return False
+        duplicate = await find_safe_duplicate(data)
+        if duplicate and is_legacy_record(duplicate):
+            # Undeliverable record (no usable Telegram source): adopt this
+            # real channel message instead of skipping or deleting it.
+            try:
+                await db.files.update_one({"file_id": duplicate["file_id"]}, {"$set": data})
+            except Exception as exc:
+                # e.g. this message is already indexed under the same source ref
+                print(f"Legacy record migration skipped for message {message.id}: {exc}")
+                return False
+            print(f"🔁 Migrated legacy record for message {message.id}: {data.get('file_name')!r}")
+            await enrich_file_record(data["file_id"], data)
+            return True
+        if duplicate and AUTO_DELETE_DUPLICATES:
+            print(f"♻️ Duplicate skipped: message={message.id}, existing={duplicate.get('file_id')}")
+            await delete_duplicate_channel_message(message, duplicate)
+            return False
+        if duplicate:
+            print(f"♻️ Duplicate detected but deletion disabled: message={message.id}")
+            return False
+        if not await db.add_file(data):
+            return False
+        print(f"🗂 Indexed ({source}): message={message.id}, name={data.get('file_name')!r}, title={data.get('title')!r}, search={data.get('search_text')!r}")
+        await enrich_file_record(data["file_id"], data)
+        return True
     except Exception as exc:
-        print(f"TMDB enrichment failed for {data['file_name']}: {exc}")
-    return True
+        print(f"❌ Index failed ({source}) message={getattr(message, 'id', '?')}: {type(exc).__name__}: {exc}")
+        return False
 
 
 async def reindex_channel(progress_callback=None, delete_duplicates=False) -> dict:
@@ -203,7 +232,7 @@ async def reindex_channel(progress_callback=None, delete_duplicates=False) -> di
             existing = await db.files.find_one({"file_unique_id": data.get("file_unique_id")})
             duplicate = await find_safe_duplicate(data)
             is_other_record = duplicate and (not existing or duplicate.get("file_id") != existing.get("file_id"))
-            if is_other_record and not (duplicate.get("channel_id") and duplicate.get("message_id")):
+            if is_other_record and is_legacy_record(duplicate):
                 # Legacy record (no Telegram source reference): migrate it onto
                 # this real channel message instead of deleting the message.
                 await db.files.update_one({"file_id": duplicate["file_id"]}, {"$set": data})
@@ -256,6 +285,45 @@ def format_reindex_progress(stats: dict, started_at: float, running: bool = True
             f"♻️ Duplicate candidates: `{stats.get('duplicates', 0)}`\n⚠️ Failed: `{stats['failed']}`\n⚡ Speed: `{stats['scanned']/elapsed:.1f} files/s`\n🆔 Last message: `{stats.get('last_message_id', 0)}`")
 
 
+POLL_SECONDS = 30
+POLL_LIMIT = 100
+
+
+async def scan_recent_messages(reason="poll", limit=POLL_LIMIT) -> int:
+    """Index recent channel messages; heals anything real-time events missed."""
+    try:
+        messages = await app.get_messages(CHANNEL_ID, limit=limit)
+        media = indexed = 0
+        for message in messages:
+            if not (message.document or message.video or message.audio):
+                continue
+            media += 1
+            if await index_media_message(message, source):
+                indexed += 1
+        print(f"🔄 Channel scan ({reason}): checked={len(messages)}, media={media}, newly_indexed={indexed}")
+        return indexed
+    except Exception as exc:
+        print(f"❌ Channel scan failed ({reason}): {type(exc).__name__}: {exc}")
+        return 0
+
+
+async def channel_poll_loop():
+    await asyncio.sleep(5)
+    while True:
+        await scan_recent_messages("poll", POLL_LIMIT)
+        await asyncio.sleep(POLL_SECONDS)
+
+
+async def probe_and_catch_up():
+    await asyncio.sleep(2)
+    try:
+        entity = await app.get_entity(CHANNEL_ID)
+        print(f"🔎 Channel access OK: id={CHANNEL_ID}, title={getattr(entity, 'title', None)!r}")
+        await scan_recent_messages("startup", 100)
+    except Exception as exc:
+        print(f"❌ CHANNEL ACCESS/CATCH-UP FAILED: {type(exc).__name__}: {exc}")
+
+
 async def subscribed(user_id: int) -> bool:
     if not FORCE_SUB_CHANNEL:
         return True
@@ -272,6 +340,14 @@ async def subscribed(user_id: int) -> bool:
 async def build_results(query: str, page: int):
     total = await db.count_grouped_movies(query)
     rows = await db.find_grouped_movies(query, page * RESULTS_PER_PAGE, RESULTS_PER_PAGE)
+    if not total:
+        # Exact phrase matched nothing: forgive small typos/word-order issues
+        # by matching against the distinct indexed titles.
+        titles = await db.fuzzy_match_titles(query)
+        if titles:
+            print(f"🔎 Fuzzy search for {query!r} matched: {titles}")
+            total = await db.count_grouped_by_titles(titles)
+            rows = await db.find_grouped_by_titles(titles, page * RESULTS_PER_PAGE, RESULTS_PER_PAGE)
     items = []
     for row in rows:
         item = row["representative"]
@@ -280,6 +356,7 @@ async def build_results(query: str, page: int):
         except Exception:
             pass
         items.append(item)
+    print(f"🔎 Search {query!r} page={page}: {total} result group(s)")
     return total, items
 
 
@@ -337,6 +414,19 @@ async def find_movie_files(tmdb_id, language=None, fallback_key=None):
 
 
 async def send_file_after_verification(user_id: int, file_id: str, caption_item: dict):
+    chat_id = caption_item.get("channel_id")
+    message_id = caption_item.get("message_id")
+    if chat_id is not None and message_id is not None:
+        try:
+            source = await app.get_messages(int(chat_id), ids=int(message_id))
+            if source and (source.document or source.video or source.audio):
+                print(f"📤 Delivering source {chat_id}:{message_id} to user {user_id}")
+                await app.send_file(user_id, source.media, caption=file_card(caption_item), parse_mode="md")
+                print(f"✅ File delivered from {chat_id}:{message_id}")
+                return
+            print(f"⚠️ Source {chat_id}:{message_id} has no supported media")
+        except Exception as exc:
+            print(f"❌ Source delivery failed {chat_id}:{message_id}: {type(exc).__name__}: {exc}")
     await app.send_file(user_id, file_id, caption=file_card(caption_item), parse_mode="md")
 
 
@@ -498,7 +588,8 @@ async def noop(event):
 async def index_channel(event):
     message = event.message
     print(f"📦 Channel media update received: chat_id={message.chat_id}, message_id={message.id}")
-    await index_media_message(message)
+    if await index_media_message(message, "event"):
+        print(f"✅ New channel file indexed: message={message.id}")
 
 
 @app.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
@@ -551,6 +642,9 @@ async def main():
         print(f"✅ Telegram connection established: @{me.username} (id={me.id})")
         print(f"✅ Telethon handlers registered: {len(app.list_event_handlers())}")
         print("🟢 Bot is ready to receive Telegram updates")
+
+        asyncio.create_task(probe_and_catch_up())
+        asyncio.create_task(channel_poll_loop())
 
         await app.run_until_disconnected()
 
