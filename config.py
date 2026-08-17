@@ -16,7 +16,16 @@ API_HASH = required("API_HASH")
 BOT_TOKEN = required("BOT_TOKEN")
 MONGO_URI = required("MONGO_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "movies_magic_club")
-CHANNEL_ID = int(required("CHANNEL_ID"))
+def _normalize_channel_id(raw: int) -> int:
+    """Telethon resolves a bare positive ID as a user peer; channels need the
+    marked ``-100<id>`` form. Accept any form from the environment."""
+    text = str(raw)
+    if text.startswith("-100"):
+        return raw
+    return int(f"-100{abs(raw)}")
+
+
+CHANNEL_ID = _normalize_channel_id(int(required("CHANNEL_ID")))
 ADMINS = {int(x) for x in os.getenv("ADMINS", "").split() if x.strip().lstrip("-").isdigit()}
 FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "").strip()
 RESULTS_PER_PAGE = max(1, int(os.getenv("RESULTS_PER_PAGE", "8")))

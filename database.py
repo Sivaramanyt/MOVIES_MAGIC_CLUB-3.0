@@ -1,4 +1,19 @@
+import re
+
 from motor.motor_asyncio import AsyncIOMotorClient
+
+from parser import normalize_search_text, parse_media
+
+
+def _search_regex(query: str) -> dict:
+    """Case-insensitive substring regex over normalized search text.
+
+    Both sides are normalized with parser.normalize_search_text so separator
+    style (spaces vs dots vs underscores) cannot cause false negatives.
+    """
+    normalized = normalize_search_text(query)
+    pattern = re.escape(normalized) if normalized else r"[^\s\S]"
+    return {"$regex": pattern, "$options": "i"}
 
 
 class Database:
@@ -57,14 +72,12 @@ class Database:
         await self.files.update_one({"file_id": file_id}, {"$set": metadata})
 
     async def search_files(self, query: str, skip: int, limit: int):
-        safe = query.replace(".", r"\.").replace("*", "").strip()
-        regex = {"$regex": safe, "$options": "i"}
+        regex = _search_regex(query)
         cursor = self.files.find({"search_text": regex}).sort("_id", -1).skip(skip).limit(limit)
         return await cursor.to_list(length=limit)
 
     async def count_files(self, query: str) -> int:
-        safe = query.replace(".", r"\.").replace("*", "").strip()
-        regex = {"$regex": safe, "$options": "i"}
+        regex = _search_regex(query)
         return await self.files.count_documents({"search_text": regex})
 
     @staticmethod
@@ -97,8 +110,7 @@ class Database:
         ]
 
     async def find_grouped_movies(self, query: str, skip: int, limit: int):
-        safe = query.replace(".", r"\.").replace("*", "").strip()
-        regex = {"$regex": safe, "$options": "i"}
+        regex = _search_regex(query)
         pipeline = self._group_pipeline(regex) + [
             {"$sort": {"_id": -1}},
             {
@@ -126,8 +138,7 @@ class Database:
         return rows
 
     async def count_grouped_movies(self, query: str) -> int:
-        safe = query.replace(".", r"\.").replace("*", "").strip()
-        regex = {"$regex": safe, "$options": "i"}
+        regex = _search_regex(query)
         pipeline = self._group_pipeline(regex) + [
             {"$group": {"_id": "$group_key"}},
             {"$count": "total"},
@@ -154,6 +165,29 @@ class Database:
                 {"$set": metadata},
                 upsert=True,
             )
+
+    async def normalize_search_index(self) -> dict:
+        """Recompute search_text/normalized_title for existing records.
+
+        Records indexed before search normalization (or by the old Pyrogram
+        code) keep raw filenames in search_text, which normalized queries
+        cannot match. Rewriting from file_name is cheap and idempotent.
+        """
+        checked = updated = 0
+        projection = {"file_name": 1, "title": 1, "search_text": 1, "normalized_title": 1}
+        async for doc in self.files.find({}, projection):
+            checked += 1
+            name = doc.get("file_name") or doc.get("title") or ""
+            meta = parse_media(name)
+            sets = {}
+            if meta["search_text"] and doc.get("search_text") != meta["search_text"]:
+                sets["search_text"] = meta["search_text"]
+            if doc.get("normalized_title") != meta["normalized_title"]:
+                sets["normalized_title"] = meta["normalized_title"]
+            if sets:
+                await self.files.update_one({"_id": doc["_id"]}, {"$set": sets})
+                updated += 1
+        return {"checked": checked, "updated": updated}
 
     async def stats(self):
         return (

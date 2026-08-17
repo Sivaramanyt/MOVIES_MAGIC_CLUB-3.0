@@ -154,6 +154,24 @@ async def index_media_message(message) -> bool:
     if not data.get("file_id"):
         return False
     duplicate = await find_safe_duplicate(data)
+    if duplicate and not (duplicate.get("channel_id") and duplicate.get("message_id")):
+        # Legacy record without a Telegram source reference: adopt this real
+        # channel message instead of skipping (or deleting) it.
+        try:
+            await db.files.update_one({"file_id": duplicate["file_id"]}, {"$set": data})
+        except Exception as exc:
+            # e.g. this message is already indexed under the same source ref
+            print(f"Legacy record migration skipped for message {message.id}: {exc}")
+            return False
+        print(f"🔁 Migrated legacy record for message {message.id}: {data.get('file_name')!r}")
+        try:
+            enriched = await tmdb.enrich(data.get("title", ""), data.get("year"))
+            if enriched:
+                await db.update_file_tmdb(data["file_id"], enriched)
+                await db.save_movie(enriched)
+        except Exception as exc:
+            print(f"TMDB enrichment failed for {data['file_name']}: {exc}")
+        return True
     if duplicate and AUTO_DELETE_DUPLICATES:
         await delete_duplicate_channel_message(message, duplicate)
         return False
@@ -185,6 +203,19 @@ async def reindex_channel(progress_callback=None, delete_duplicates=False) -> di
             existing = await db.files.find_one({"file_unique_id": data.get("file_unique_id")})
             duplicate = await find_safe_duplicate(data)
             is_other_record = duplicate and (not existing or duplicate.get("file_id") != existing.get("file_id"))
+            if is_other_record and not (duplicate.get("channel_id") and duplicate.get("message_id")):
+                # Legacy record (no Telegram source reference): migrate it onto
+                # this real channel message instead of deleting the message.
+                await db.files.update_one({"file_id": duplicate["file_id"]}, {"$set": data})
+                stats["indexed"] += 1
+                metadata = await tmdb.enrich(data.get("title", ""), data.get("year"))
+                if metadata:
+                    await db.update_file_tmdb(data["file_id"], metadata)
+                    await db.save_movie(metadata)
+                    stats["enriched"] += 1
+                if progress_callback:
+                    await progress_callback(dict(stats))
+                continue
             if is_other_record:
                 if delete_duplicates:
                     if await delete_duplicate_channel_message(history_message, duplicate, "reindex duplicate"):
@@ -501,6 +532,12 @@ async def main():
         print("🔧 Initializing MongoDB...")
         await db.setup()
         print("✅ MongoDB initialized")
+
+        try:
+            migration = await db.normalize_search_index()
+            print(f"🔧 Search index normalization: checked={migration['checked']}, updated={migration['updated']}")
+        except Exception as exc:
+            print(f"⚠️ Search index normalization failed: {type(exc).__name__}: {exc}")
 
         print("🔧 Initializing verification store...")
         await verification.setup()
